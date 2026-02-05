@@ -1,124 +1,157 @@
 `timescale 1ns / 1ps
 
 module ALU #(
-    parameter N = 8 // Input width (Default 8 bits based on project suggestion)
+    parameter N = 8
 )(
-    input wire clk,
-    input wire rst_n,          // Asynchronous Active Low Reset
-    input wire start,          // Start signal to begin operation
-    input wire [3:0] opcode,   // Operation selection code (Table 1)
-    input wire signed [N-1:0] A, // Input A (Signed)
-    input wire signed [N-1:0] B, // Input B (Signed)
-    
-    output reg ready,          // Ready pulse when calculation is done
-    output reg signed [2*N-1:0] result, // Output (2*N bits to handle multiplication)
-    
-    // Flags
-    output reg Z, // Zero flag
-    output reg C, // Carry flag
-    output reg V, // Overflow flag
-    output reg S, // Sign flag
-    output reg E  // Error flag
+    input  wire                  clk,
+    input  wire                  rst_n,
+    input  wire                  start,
+    input  wire [3:0]            opcode,
+    input  wire signed [N-1:0]   A,
+    input  wire signed [N-1:0]   B,
+
+    output reg                   ready,
+    output reg signed [2*N-1:0]  result,
+
+    output reg                   Z,
+    output reg                   C,
+    output reg                   V,
+    output reg                   S,
+    output reg                   E
 );
 
-    // Internal temporary result for full precision calculation
-    reg signed [2*N:0] temp_result; 
-    
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            result <= 0;
-            ready <= 0;
-            Z <= 0; C <= 0; V <= 0; S <= 0; E <= 0;
-            temp_result <= 0;
-        end else begin
-            // Default values
-            ready <= 0; 
-            
-            if (start) begin
-                // Reset flags for new operation
-                E <= 0; V <= 0; C <= 0;
-                
-                case (opcode)
-                    // --- Arithmetic Operations ---
-                    4'b0000: begin // ADD
-                        temp_result = A + B;
-                        result <= temp_result[2*N-1:0];
-                        // Carry check for unsigned interpretation (usually relevant for adder)
-                        // Overflow check for signed: (pos+pos=neg) or (neg+neg=pos)
-                        V <= ((A[N-1] == B[N-1]) && (result[N-1] != A[N-1]));
-                        C <= temp_result[N]; // Capture carry out
-                    end
-                    
-                    4'b0001: begin // SUB (A - B)
-                        temp_result = A - B;
-                        result <= temp_result[2*N-1:0];
-                        // Overflow for sub: (pos-neg=neg) or (neg-pos=pos)
-                        V <= ((A[N-1] != B[N-1]) && (result[N-1] != A[N-1]));
-                        C <= temp_result[N]; // Borrow usually indicated here
-                    end
-                    
-                    4'b0010: begin // MUL (Bonus)
-                        result <= A * B;
-                        // Overflow is less relevant in 2N output, but we keep V=0
-                    end
-                    
-                    4'b0011: begin // DIV (Bonus)
-                        if (B == 0) begin
-                            result <= 0;
-                            E <= 1; // Error: Divide by Zero
-                        end else begin
-                            result <= A / B;
-                        end
-                    end
-                    
-                    4'b0100: begin // MOD (Bonus)
-                        if (B == 0) begin
-                            result <= 0;
-                            E <= 1; // Error: Divide by Zero
-                        end else begin
-                            result <= A % B;
-                        end
-                    end
-                    
-                    // --- Bitwise Operations ---
-                    4'b0101: result <= A & B; // AND
-                    4'b0110: result <= A | B; // OR
-                    4'b0111: result <= A ^ B; // XOR
-                    4'b1000: result <= ~A;    // NOT A (Bitwise Complement)
-                    
-                    // --- Shift Operations ---
-                    // Using $unsigned(B) to use the value of B as shift amount
-                    4'b1001: result <= A << $unsigned(B[2:0]); // SHL (Limit shift amount for safety)
-                    4'b1010: result <= A >> $unsigned(B[2:0]); // SHR
-                    
-                    // --- Comparison Operations ---
-                    4'b1011: result <= (A == B) ? 1 : 0; // EQ
-                    4'b1100: result <= (A > B)  ? 1 : 0; // GT
-                    4'b1101: result <= (A < B)  ? 1 : 0; // LT
-                    
-                    default: begin
-                        result <= 0;
-                        E <= 1; // Invalid Opcode
-                    end
-                endcase
-                
-                // Set common flags
-                // Note: These are set based on the NEXT value of result (non-blocking simulation logic)
-                // To be precise in hardware, we should assign them in the next cycle or use blocking assignments for temp vars.
-                // Here we set 'ready' to 1 in the NEXT cycle, so the receiver reads the registered result.
-                ready <= 1;
-            end 
-        end
+    // shift amount width = log2(N)
+    localparam integer SHW = (N <= 1) ? 1 : $clog2(N);
+
+    // latched inputs
+    reg [3:0]          op_r;
+    reg signed [N-1:0] A_r, B_r;
+
+    reg pending;
+
+    // combinational next values
+    reg signed [2*N-1:0] res_next;
+    reg Z_next, C_next, V_next, S_next, E_next;
+
+    // helpers
+    reg [N:0] add_u, sub_u;
+    reg signed [N-1:0] add_n, sub_n;
+
+    reg signed [N-1:0] div_q;
+    reg signed [N-1:0] mod_r;
+
+    wire [SHW-1:0] shamt;
+    assign shamt = B_r[SHW-1:0];
+
+    always @(*) begin
+        // defaults
+        res_next = '0;
+        Z_next   = 1'b0;
+        C_next   = 1'b0;
+        V_next   = 1'b0;
+        S_next   = 1'b0;
+        E_next   = 1'b0;
+
+        add_u = {1'b0, $unsigned(A_r)} + {1'b0, $unsigned(B_r)};
+        sub_u = {1'b0, $unsigned(A_r)} - {1'b0, $unsigned(B_r)};
+        add_n = A_r + B_r;
+        sub_n = A_r - B_r;
+
+        div_q = '0;
+        mod_r = '0;
+
+        case (op_r)
+            4'b0000: begin // ADD
+                res_next = {{N{add_n[N-1]}}, add_n};
+                C_next   = add_u[N];
+                V_next   = (A_r[N-1] == B_r[N-1]) && (add_n[N-1] != A_r[N-1]);
+            end
+
+            4'b0001: begin // SUB
+                res_next = {{N{sub_n[N-1]}}, sub_n};
+                C_next   = ~sub_u[N]; // ~borrow convention
+                V_next   = (A_r[N-1] != B_r[N-1]) && (sub_n[N-1] != A_r[N-1]);
+            end
+
+            4'b0010: begin // MUL
+                res_next = A_r * B_r;
+            end
+
+            4'b0011: begin // DIV
+                if (B_r == 0) begin
+                    res_next = '0;
+                    E_next   = 1'b1;
+                end else begin
+                    div_q    = A_r / B_r;
+                    res_next = {{N{div_q[N-1]}}, div_q};
+                end
+            end
+
+            4'b0100: begin // MOD
+                if (B_r == 0) begin
+                    res_next = '0;
+                    E_next   = 1'b1;
+                end else begin
+                    mod_r    = A_r % B_r;
+                    res_next = {{N{mod_r[N-1]}}, mod_r};
+                end
+            end
+
+            4'b0101: res_next = {{N{1'b0}}, (A_r & B_r)};                 // AND
+            4'b0110: res_next = {{N{1'b0}}, (A_r | B_r)};                 // OR
+            4'b0111: res_next = {{N{1'b0}}, (A_r ^ B_r)};                 // XOR
+            4'b1000: res_next = {{N{1'b0}}, (~A_r)};                      // NOT
+
+            4'b1001: res_next = {{N{1'b0}}, ($unsigned(A_r) << shamt)};   // SHL (logical)
+            4'b1010: res_next = {{N{1'b0}}, ($unsigned(A_r) >> shamt)};   // SHR (logical)
+
+            4'b1011: res_next = {{(2*N-1){1'b0}}, (A_r == B_r)};          // EQ
+            4'b1100: res_next = {{(2*N-1){1'b0}}, (A_r >  B_r)};          // GT
+            4'b1101: res_next = {{(2*N-1){1'b0}}, (A_r <  B_r)};          // LT
+
+            default: begin
+                res_next = '0;
+                E_next   = 1'b1;
+            end
+        endcase
+
+        Z_next = (res_next == 0);
+        S_next = res_next[2*N-1];
     end
 
-    // Flag Logic Update (Combinational or Registered? text implies flags are part of output)
-    // We update Z and S based on the *current registered result* to ensure stability when ready is high.
-    always @(posedge clk) begin
-        if (start) begin
-            // Wait for calculation to settle (next cycle)
-        end else if (ready) begin
-            Z <= (result == 0);
-            S <= result[2*N-1]; // Sign bit of the 2N-bit output
+    // sequential: capture on start, produce outputs next cycle
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            op_r    <= 4'd0;
+            A_r     <= '0;
+            B_r     <= '0;
+            pending <= 1'b0;
+
+            result  <= '0;
+            ready   <= 1'b0;
+
+            Z <= 1'b0; C <= 1'b0; V <= 1'b0; S <= 1'b0; E <= 1'b0;
+        end else begin
+            ready <= 1'b0;
+
+            if (start) begin
+                op_r    <= opcode;
+                A_r     <= A;
+                B_r     <= B;
+                pending <= 1'b1;
+            end
+
+            if (pending) begin
+                result  <= res_next;
+                Z       <= Z_next;
+                C       <= C_next;
+                V       <= V_next;
+                S       <= S_next;
+                E       <= E_next;
+
+                ready   <= 1'b1;
+                pending <= 1'b0;
+            end
         end
     end
 
